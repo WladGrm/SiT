@@ -65,8 +65,10 @@ def main(mode, args):
         assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
         learn_sigma = args.image_size == 256
     else:
-        learn_sigma = False
+        learn_sigma = True
 
+    learn_sigma = True
+    
     # Load model:
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
@@ -76,7 +78,12 @@ def main(mode, args):
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
+    ckpt = find_model(ckpt_path)
+    # if this is a full-train checkpoint, pull out the sub-dict under "model"
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        state_dict = ckpt["model"]
+    else:
+        state_dict = ckpt
     model.load_state_dict(state_dict)
     model.eval()  # important!
     
@@ -135,7 +142,7 @@ def main(mode, args):
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
         print(f"Saving .png samples at {sample_folder_dir}")
-    dist.barrier()
+    dist.barrier(device_ids=[device])
 
     # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
     n = args.per_proc_batch_size
@@ -150,8 +157,11 @@ def main(mode, args):
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
     done_iterations = int( int(num_samples // dist.get_world_size()) // n)
-    pbar = range(iterations)
-    pbar = tqdm(pbar) if rank == 0 else pbar
+    
+    if rank == 0:
+        pbar = tqdm(range(iterations), desc="Sampling", dynamic_ncols=True)
+    else:
+        pbar = range(iterations)
     total = 0
     
     for i in pbar:
@@ -182,14 +192,14 @@ def main(mode, args):
             index = i * dist.get_world_size() + rank + total
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
-        dist.barrier()
+        dist.barrier(device_ids=[device])
 
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
-    dist.barrier()
+    dist.barrier(device_ids=[device])
     if rank == 0:
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
-    dist.barrier()
+    dist.barrier(device_ids=[device])
     dist.destroy_process_group()
 
 
@@ -206,7 +216,7 @@ if __name__ == "__main__":
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
 
-    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-S/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--sample-dir", type=str, default="samples")
     parser.add_argument("--per-proc-batch-size", type=int, default=4)

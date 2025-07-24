@@ -32,6 +32,10 @@ from train_utils import parse_transport_args
 import wandb_utils
 
 
+import subprocess, re
+import numpy as np
+from tqdm import tqdm
+
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -149,19 +153,33 @@ def main(args):
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        learn_sigma=True
     )
 
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
 
+    # if args.ckpt is not None:
+    #     ckpt_path = args.ckpt
+    #     state_dict = find_model(ckpt_path)
+    #     model.load_state_dict(state_dict["model"])
+    #     ema.load_state_dict(state_dict["ema"])
+    #     opt.load_state_dict(state_dict["opt"])
+    #     args = state_dict["args"]
+    # Setup optimizer (needs to exist before you .load_state_dict)
+    
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    
     if args.ckpt is not None:
-        ckpt_path = args.ckpt
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
-        args = state_dict["args"]
+        # if it's a local .pt with our wrapper dict, load it directly:
+        checkpoint = torch.load(args.ckpt, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        # carry forward any args you saved
+        args = checkpoint.get("args", args)
+
 
     requires_grad(ema, False)
     
@@ -238,8 +256,12 @@ def main(args):
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
+        if rank == 0:
+            epoch_iter = tqdm(loader, desc=f"Epoch {epoch}", dynamic_ncols=True)
+        else:
+            epoch_iter = loader
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for x, y in epoch_iter:
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
@@ -257,6 +279,9 @@ def main(args):
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
+            if train_steps >= 400_001:
+                done = True
+                break
             if train_steps % args.log_every == 0:
                 # Measure training speed:
                 torch.cuda.synchronize()
@@ -276,9 +301,11 @@ def main(args):
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
-
-            # Save SiT checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+            if rank == 0 and train_steps % args.log_every == 0:
+                epoch_iter.set_postfix_str(f"loss={avg_loss:.4f}, steps/sec={steps_per_sec:.2f}")
+                
+            # Save SiT checkpoint + FID:
+            if (train_steps % args.ckpt_every == 0 and train_steps > 0) or (train_steps == 5):
                 if rank == 0:
                     checkpoint = {
                         "model": model.module.state_dict(),
@@ -289,23 +316,68 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                    
+                    # # 2) sample 50K images distributedly
+                    # cmd = (
+                    #     "torchrun --nnodes=1 --nproc_per_node=2 --rdzv-port=29501 sample_ddp.py ODE "
+                    #     f"--model {args.model} "
+                    #     f"--ckpt {checkpoint_path} "
+                    #     f"--per-proc-batch-size {local_batch_size} "
+                    #     f"--num-fid-samples 4 "
+                    #     f"--image-size {args.image_size} "
+                    #     f"--cfg-scale {args.cfg_scale} "
+                    #     f"--global-seed {args.global_seed} "
+                    #     f"--path-type {args.path_type} "
+                    #     f"--prediction {args.prediction} "
+                    #     f"--loss-weight {args.loss_weight} "
+                    #     f"--train-eps {args.train_eps} "
+                    #     f"--sample-eps {args.sample_eps}"
+                    # )
+                    # subprocess.run(cmd, shell=True, check=True)
+
+                    # # 3) run FID evaluator against your 10K ref batch
+                    # npz_path = (
+                    #     f"samples/{args.model.replace('/','-')}-"
+                    #     f"{os.path.basename(checkpoint_path).replace('.pt','')}-"
+                    #     f"cfg-{args.cfg_scale}-{local_batch_size}-ODE-50000.npz"
+                    # )
+                    # out = subprocess.check_output(
+                    #     f"python evaluator.py {args.ref_batch} {npz_path}",
+                    #     shell=True
+                    # ).decode()
+
+                    # # 4) parse and log FID_50k to WandB
+                    # m = re.search(r"FID:\s*([0-9\.]+)", out)
+                    # if m and args.wandb:
+                    #     fid50k = float(m.group(1))
+                    #     wandb_utils.log({"FID_50k": fid50k}, step=train_steps)
+                    # logger.info(f"[{train_steps:07d}] FID_50k = {m.group(1) if m else 'N/A'}")
+                dist.barrier(device_ids=[device])
             
-            if train_steps % args.sample_every == 0 and train_steps > 0:
+            if (train_steps % args.sample_every == 0 and train_steps > 0) or train_steps == 3:
                 logger.info("Generating EMA samples...")
-                sample_fn = transport_sampler.sample_ode() # default to ode sampling
-                samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
-                dist.barrier()
+                with torch.no_grad():
+                    sample_fn = transport_sampler.sample_ode() # default to ode sampling
+                    samples = sample_fn(zs, model_fn, **sample_model_kwargs)[-1]
+                    #dist.barrier(device_ids=[device])
 
-                if use_cfg: #remove null samples
-                    samples, _ = samples.chunk(2, dim=0)
-                samples = vae.decode(samples / 0.18215).sample
-                out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
-                dist.all_gather_into_tensor(out_samples, samples)
+                    if use_cfg: #remove null samples
+                        samples, _ = samples.chunk(2, dim=0)
+                        
+                    # samples = vae.decode(samples / 0.18215).sample
+                    # out_samples = torch.zeros((args.global_batch_size, 3, args.image_size, args.image_size), device=device)
+                    # dist.all_gather_into_tensor(out_samples, samples)
+                    
+                    # decode only your local mini‐batch
+                    decoded = vae.decode(samples / 0.18215).sample  # [local_batch_size,3,H,W]
+                    # optionally pick just the first few imgs for logging:
+                    decoded = decoded[: min(len(decoded), 9)]
                 if args.wandb:
-                    wandb_utils.log_image(out_samples, train_steps)
+                    wandb_utils.log_image(decoded, train_steps)
                 logging.info("Generating EMA samples done.")
-
+                
+        if 'done' in locals() and done:
+            break
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -318,7 +390,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-S/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
@@ -327,10 +399,13 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt-every", type=int, default=25_000)
     parser.add_argument("--sample-every", type=int, default=10_000)
-    parser.add_argument("--cfg-scale", type=float, default=4.0)
+    parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument(
+        "--ref-batch", type=str, default="../guided-diffusion/evaluations/data/VIRTUAL_imagenet256_labeled.npz",
+        help="Path to your reference .npz (e.g. VIRTUAL_imagenet256_labeled.npz) for FID-10k")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
 
