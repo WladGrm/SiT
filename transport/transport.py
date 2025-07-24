@@ -112,6 +112,37 @@ class Transport:
         t = t.to(x1)
         return t, x0, x1
     
+    def distillation_loss(
+        self,
+        teacher_model: torch.nn.Module,
+        student_model: torch.nn.Module,
+        x1: torch.Tensor,
+        model_kwargs: dict = None,
+    ) -> torch.Tensor:
+        """
+        Compute L = −2 ⟨v★(xₜ, t) − vθ(xₜ, t), uₜ⟩ averaged over the batch,
+        where (t, x₀, x₁) ← sample(x₁) and (xₜ, uₜ) ← path_sampler.plan(…).
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        # 1) sample times & endpoints
+        t, x0, x1 = self.sample(x1)
+        # 2) get interpolated x_t and velocity u_t
+        t, xt, ut = self.path_sampler.plan(t, x0, x1)
+        # 3) teacher velocity v★ (no grad through teacher)
+        with torch.no_grad():
+            v_star = teacher_model(xt, t, **model_kwargs)
+        # 4) student velocity vθ
+            v_theta = student_model(xt, t, **model_kwargs)
+        # 5) compute −2 ⟨v★ − vθ, uₜ⟩
+        #    inner product over all non‐batch dims, then mean over batch
+        #    assume shape [B, *spatial, C], so we flatten per‐example
+        diff = (v_star - v_theta).view(v_star.size(0), -1)
+        u_flat = ut.view(ut.size(0), -1)
+        dot = (diff * u_flat).sum(dim=1)      # [B]
+        loss = (-2.0 * dot).mean()           # scalar
+        return loss
+    
 
     def training_losses(
         self, 
@@ -136,6 +167,7 @@ class Transport:
 
         terms = {}
         terms['pred'] = model_output
+            
         if self.model_type == ModelType.VELOCITY:
             terms['loss'] = mean_flat(((model_output - ut) ** 2))
         else: 
@@ -342,7 +374,7 @@ class Sampler:
         self,
         *,
         sampling_method="dopri5",
-        num_steps=50,
+        num_steps=250,
         atol=1e-6,
         rtol=1e-3,
         reverse=False,

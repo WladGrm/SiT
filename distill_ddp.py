@@ -107,7 +107,8 @@ def main():
 
     # — Setup loop —
     latent_shape = (args.batch, 4, args.image_size // 8, args.image_size // 8)
-    t_fixed = torch.full((args.batch,), args.sample_eps, device=device)
+    # t_fixed = torch.full((args.batch,), args.sample_eps, device=device)
+    t_fixed = torch.full((args.batch,), 0.5, device=device)
     pbar = tqdm(range(1, args.iters + 1),
                 disable=(rank != 0),
                 desc="Distilling")
@@ -136,13 +137,19 @@ def main():
         requires_grad(critic, False)
         for _ in range(args.k_G):
             x1_hat = G(z, t, y)
-            L_star = transport.training_losses(
-                ema, x1_hat, dict(y=y)
-            )["loss"].mean()
-            L_psi  = transport.training_losses(
-                critic, x1_hat, dict(y=y)
-            )["loss"].mean()
-            gap    = L_star - L_psi
+            # L_star = transport.training_losses(
+            #     ema, x1_hat, dict(y=y)
+            # )["loss"].mean()
+            # L_psi  = transport.training_losses(
+            #     critic, x1_hat, dict(y=y)
+            # )["loss"].mean()
+            # gap    = L_star - L_psi
+            gap = transport.distillation_loss(
+                teacher_model=ema, 
+                student_model=critic,       
+                x1=x1_hat,
+                model_kwargs=dict(y=y)
+                )
             opt_G.zero_grad(); gap.backward(); opt_G.step()
 
         # — W&B logging —
